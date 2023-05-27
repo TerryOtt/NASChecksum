@@ -6,23 +6,34 @@ import sys
 import pprint
 import json
 import multiprocessing
+import hashlib
+
 
 def _main():
     args = _parse_cli_args()
     checksum_file_dict = _enumerate_files_to_checksum(args)
     _compute_checksums(args, checksum_file_dict)
+    print("Computed checksums:\n" + json.dumps(checksum_file_dict, indent=4, sort_keys=True))
 
 
 def _parse_cli_args():
     arg_parser = argparse.ArgumentParser(description="Checksum directory trees off the NAS")
+
     default_child_worker_processes = multiprocessing.cpu_count() - 1
     arg_parser.add_argument("--workers", type=int, default=default_child_worker_processes,
                             help="Optional number of child worker processes "
                             f"(default {default_child_worker_processes} due to CPU supporting "
                             f"{multiprocessing.cpu_count()} threads)")
+
+    default_queue_depth = 4096
+    arg_parser.add_argument("--queuedepth", type=int, default=default_queue_depth,
+                            help="Optional queue depth "
+                            f"(default {default_queue_depth} to limit memory usage)")
+
     arg_parser.add_argument("checksum_json_file", help="file to store checksums from all the given directories")
     arg_parser.add_argument("source_rootdir_to_checksum", nargs="+",
                             help="Path to directory that all files under it should be added to checksum file")
+
     return arg_parser.parse_args()
 
 
@@ -65,8 +76,8 @@ def _enumerate_files_to_checksum(args):
 
 def _compute_checksums(args, checksum_file_dict):
     # Create multi-process Queues for sending files to be checksummed, and then once checksum is computed
-    queue_for_files_awaiting_checksumming = multiprocessing.Queue()
-    queue_of_checksummed_files = multiprocessing.Queue()
+    queue_for_files_awaiting_checksumming = multiprocessing.Queue(args.queuedepth)
+    queue_of_checksummed_files = multiprocessing.Queue(args.queuedepth)
 
     # Event where parent process indicates all work is now completed
     all_checksum_work_completed = multiprocessing.Event()
@@ -85,7 +96,10 @@ def _compute_checksums(args, checksum_file_dict):
 
     for curr_source_rootdir in checksum_file_dict['source_rootdirs']:
         for curr_relative_path_to_checksum in checksum_file_dict['source_rootdirs'][curr_source_rootdir]:
-            checksum_queue_entry = ( curr_source_rootdir, curr_relative_path_to_checksum )
+            checksum_queue_entry = {
+                'source_rootdir'    : curr_source_rootdir,
+                'relative_path'     : curr_relative_path_to_checksum
+            }
 
             #print("Going to push this entry into checksumming queue: " + pprint.pformat(checksum_queue_entry))
             queue_for_files_awaiting_checksumming.put(checksum_queue_entry)
@@ -93,8 +107,13 @@ def _compute_checksums(args, checksum_file_dict):
             # Now read all the entries we can out of the computed checksum queue to keep all processes busy
             while True:
                 try:
-                    print("Parent awaiting a write to the checksummed file queue")
+                    #print("Parent awaiting a write to the checksummed file queue")
                     checksummed_file_entry = queue_of_checksummed_files.get_nowait()
+                    print("Got entry:\n" + json.dumps(checksummed_file_entry, indent=4, sort_keys=True))
+
+                    checksum_file_dict['source_rootdirs'][ checksummed_file_entry['source_rootdir'] ][
+                        checksummed_file_entry['relative_path']]['hashes'] = checksummed_file_entry['hashes']
+
                     number_of_files_awaiting_checksum -= 1
 
                     print("Parent got a checksum back, number of files awaiting checksum: "
@@ -104,8 +123,12 @@ def _compute_checksums(args, checksum_file_dict):
                     break
     # Wrote all entries in the queue for checksumming, get all remaining entries from child queue
     while number_of_files_awaiting_checksum > 0:
-        print("Parent awaiting a write to the checksummed file queue")
+        #print("Parent awaiting a write to the checksummed file queue")
         checksummed_file_entry = queue_of_checksummed_files.get()
+        print("Got entry:\n" + json.dumps(checksummed_file_entry, indent=4, sort_keys=True))
+        checksum_file_dict['source_rootdirs'][checksummed_file_entry['source_rootdir']][
+            checksummed_file_entry['relative_path']]['hashes'] = checksummed_file_entry['hashes']
+
         number_of_files_awaiting_checksum -= 1
 
         print("Parent got a checksum back, number of files awaiting checksum: "
@@ -138,17 +161,38 @@ def _checksum_worker(worker_index, queue_for_files_awaiting_checksum, queue_of_c
 
     queue_read_timeout_seconds = 0.1
     blocking_read = True
+
     while all_checksum_work_completed.is_set() is False:
         # Try a blocking read off the incoming queue
         try:
             item_to_checksum = queue_for_files_awaiting_checksum.get(block=blocking_read,
                                                                      timeout=queue_read_timeout_seconds)
-            #print("Worker got item to checksum: " + pprint.pformat(item_to_checksum))
-            # Fake out a checksum was completed
-            checksummed_item = ("foo", "bar", "01234567890abcdef")
-            print("Child worker going to put something in checksum queue")
+            # print("Worker got item to checksum: " + pprint.pformat(item_to_checksum))
+
+            full_path_to_file = os.path.join(
+                item_to_checksum['source_rootdir'],
+                item_to_checksum['relative_path'])
+
+            with open(full_path_to_file, "rb") as f:
+                try:
+                    file_contents = f.read()
+                except Exception as e:
+                    print("Something blew up in IO")
+                    continue
+
+            computed_hash = hashlib.sha3_512(file_contents).hexdigest()
+
+            checksummed_item = {
+                "hashes": {
+                    "sha3_512": computed_hash
+                }
+            }
+            # Merge in the contents of the incomingfile info so we have complete context about WHICH file got
+            #       checksummed
+            checksummed_item.update(item_to_checksum)
+            #print("Child worker going to put something in checksum queue")
             queue_of_checksummed_files.put(checksummed_item)
-            print("Child worker successfully added to checksum queue")
+            #print("Child worker successfully added to checksum queue")
         except queue.Empty as e:
             continue
 
