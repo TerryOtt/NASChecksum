@@ -11,17 +11,38 @@ import hashlib
 
 def _main():
     args = _parse_cli_args()
-    checksum_file_dict = _enumerate_files_to_checksum(args)
-    _compute_checksums(args, checksum_file_dict)
-    #print("Computed checksums:\n" + json.dumps(checksum_file_dict, indent=4, sort_keys=True))
 
-    _write_checksum_to_file(args, checksum_file_dict)
+    checksum_file_dict = _enumerate_files_to_checksum(args)
+    existing_checksums = _read_existing_checksums(args)
+
+    if args.force_checksums is False:
+        number_merged_checksums = _merge_in_existing_checksums(checksum_file_dict, existing_checksums)
+    else:
+        number_merged_checksums = 0
+
+    total_files_in_sourcedirs = _count_files_in_hash_dictionary(checksum_file_dict)
+    if total_files_in_sourcedirs - number_merged_checksums > 0:
+        work_to_do = True
+    else:
+        work_to_do = False
+
+    if work_to_do:
+        _compute_checksums(args, checksum_file_dict, total_files_in_sourcedirs - number_merged_checksums)
+        #print("Computed checksums:\n" + json.dumps(checksum_file_dict, indent=4, sort_keys=True))
+
+        _merge_checksums_not_in_sourcedirs(checksum_file_dict, existing_checksums)
+
+        _write_checksum_to_file(args, checksum_file_dict)
+    else:
+        print("\nSkipped all checksum computations -- no new checksums to compute!")
 
 
 def _parse_cli_args():
     arg_parser = argparse.ArgumentParser(description="Checksum directory trees off the NAS")
 
-    default_child_worker_processes = multiprocessing.cpu_count() - 1
+    # Determined experimentally -- ran values from 1 to 32 and then binary searched to best CPU
+    #       utilization
+    default_child_worker_processes = 16  # multiprocessing.cpu_count() - 1
     arg_parser.add_argument("--workers", type=int, default=default_child_worker_processes,
                             help="Optional number of child worker processes "
                             f"(default {default_child_worker_processes} due to CPU supporting "
@@ -31,6 +52,11 @@ def _parse_cli_args():
     arg_parser.add_argument("--queuedepth", type=int, default=default_queue_depth,
                             help="Optional queue depth "
                             f"(default {default_queue_depth} to limit memory usage)")
+
+    default_skip_existing_files = True
+    arg_parser.add_argument("--force-checksums", action='store_true',
+                            help="Force computing all checksums in root dirs, "
+                            "even if found in existing checksum JSON file")
 
     arg_parser.add_argument("checksum_json_file", help="file to store checksums from all the given directories")
     arg_parser.add_argument("source_rootdir_to_checksum", nargs="+",
@@ -78,15 +104,50 @@ def _enumerate_files_to_checksum(args):
     return checksum_dict
 
 
-def _compute_checksums(args, checksum_file_dict):
+def _read_existing_checksums(args):
+    existing_checksums = None
+    if os.path.isfile(args.checksum_json_file):
+        print("\nReading existing checksums")
+        print(f"\t- Reading pre-existing checksums from \"{args.checksum_json_file}\"")
+
+        with open(args.checksum_json_file, "r") as existing_checksum_file:
+            existing_checksums = json.load(existing_checksum_file)
+
+        number_of_files_already_checksummed = _count_files_in_hash_dictionary(existing_checksums)
+        print(f"\t- Total existing checksums found: {number_of_files_already_checksummed:6,}")
+
+        print("Reading existing checksums complete!")
+    else:
+        existing_checksums = {
+            'source_rootdirs': {}
+        }
+
+    return existing_checksums
+
+
+def _merge_in_existing_checksums(checksum_file_dict, existing_checksums):
+    print("\nDetermining checksums we can skip due to having previously computed them")
+    checksums_skipped = 0
+    for curr_sourcedir in checksum_file_dict['source_rootdirs']:
+        for curr_relative_path in checksum_file_dict['source_rootdirs'][curr_sourcedir]:
+            if curr_sourcedir in existing_checksums['source_rootdirs']:
+                if curr_relative_path in existing_checksums['source_rootdirs'][curr_sourcedir]:
+                    checksums_skipped += 1
+                    checksum_file_dict['source_rootdirs'][curr_sourcedir][curr_relative_path] = \
+                        existing_checksums['source_rootdirs'][curr_sourcedir][curr_relative_path]
+
+    print(f"\t- Number of checksums skipped: {checksums_skipped:,}")
+
+    print("Work reduction complete!")
+
+    return checksums_skipped
+
+
+def _compute_checksums(args, checksum_file_dict, number_of_files_awaiting_checksum):
 
     print("\nComputing file checksums")
-     # Quickly determine how many files we're going to checksum, so we know when all the checksum work is done
-    number_of_files_awaiting_checksum = 0
-    for curr_source_rootdir in checksum_file_dict['source_rootdirs']:
-        for curr_relative_path_to_checksum in checksum_file_dict['source_rootdirs'][curr_source_rootdir]:
-            number_of_files_awaiting_checksum += 1
 
+    # Quickly determine how many files we're going to checksum, so we know when all the checksum work is done
     print(f"\t- Total number of files to compute checksums for: {number_of_files_awaiting_checksum:6,}")
 
     # Create multi-process Queues for sending files to be checksummed, and then once checksum is computed
@@ -102,6 +163,12 @@ def _compute_checksums(args, checksum_file_dict):
 
     for curr_source_rootdir in checksum_file_dict['source_rootdirs']:
         for curr_relative_path_to_checksum in checksum_file_dict['source_rootdirs'][curr_source_rootdir]:
+
+            # See if there's any work here to do -- if it already has hashes, we merged in from existing,
+            #       no work to do!
+            if 'hashes' in checksum_file_dict['source_rootdirs'][curr_source_rootdir][curr_relative_path_to_checksum]:
+                continue
+
             checksum_queue_entry = {
                 'source_rootdir'    : curr_source_rootdir,
                 'relative_path'     : curr_relative_path_to_checksum
@@ -146,6 +213,16 @@ def _compute_checksums(args, checksum_file_dict):
     _wait_for_all_child_worker_processes_to_rejoin(child_process_handles)
 
     print("File checksum computations complete!")
+
+
+def _count_files_in_hash_dictionary(hash_dictionary):
+    # Quickly determine how many files we're going to checksum, so we know when all the checksum work is done
+    number_of_files_awaiting_checksum = 0
+    for curr_source_rootdir in hash_dictionary['source_rootdirs']:
+        for curr_relative_path_to_checksum in hash_dictionary['source_rootdirs'][curr_source_rootdir]:
+            number_of_files_awaiting_checksum += 1
+
+    return number_of_files_awaiting_checksum
 
 
 def _launch_checksum_worker_processes(args, queue_for_files_awaiting_checksum, queue_of_checksummed_files,
@@ -213,8 +290,22 @@ def _wait_for_all_child_worker_processes_to_rejoin(child_worker_handles):
     # print("All child worker processes rejoined cleanly!")
 
 
+def _merge_checksums_not_in_sourcedirs(checksum_file_dict, existing_checksums):
+    print("\nMerging in sourcedirs from checksum JSON but not included in this run")
+    checksums_merged_in = 0
+    for curr_existing_sourcedir in existing_checksums['source_rootdirs']:
+        # If we didn't know anything about this sourcedir, fold the whole tree in and be done here
+        if curr_existing_sourcedir not in checksum_file_dict['source_rootdirs']:
+            checksums_merged_in += len(existing_checksums['source_rootdirs'][curr_existing_sourcedir])
+            checksum_file_dict['source_rootdirs'][curr_existing_sourcedir] = \
+                existing_checksums['source_rootdirs'][curr_existing_sourcedir]
+    print(f"\t- Checksums merged in: {checksums_merged_in:,}")
+    print("Checksum merging complete!")
+
+
 def _write_checksum_to_file(args, checksum_file_dict):
     print("\nWriting file checksums to disk")
+    print(f"\t- Writing {_count_files_in_hash_dictionary(checksum_file_dict):,} checksums")
     print(f"\t- Writing to file \"{args.checksum_json_file}\"")
     with open(args.checksum_json_file, "w") as output_json:
         json.dump(checksum_file_dict, output_json, indent=4, sort_keys=True)
